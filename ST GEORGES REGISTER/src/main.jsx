@@ -77,140 +77,165 @@ function Login({show,msg}){
 }
 
 function Dashboard({profile,admin,settings}){
- const teacher=profile.role==='teacher';
- const [date,setDate]=useState(today());
- const [view,setView]=useState(teacher?'stream':'whole');
- const [selectedGrade,setSelectedGrade]=useState(teacher?profile.grade||'':'');
- const [selectedStream,setSelectedStream]=useState(teacher?profile.stream||'':'');
- const [selectedLearner,setSelectedLearner]=useState('');
- const [allLearners,setAllLearners]=useState([]);
- const [learners,setLearners]=useState([]);
- const [attendance,setAttendance]=useState([]);
- const [error,setError]=useState('');
- const [busy,setBusy]=useState(false);
+  const teacher=profile.role==='teacher';
+  const [date,setDate]=useState(today());
+  const [view,setView]=useState(teacher?'stream':'whole');
+  const [selectedGrade,setSelectedGrade]=useState(teacher?profile.grade||'':'');
+  const [selectedStream,setSelectedStream]=useState(teacher?profile.stream||'':'');
+  const [selectedLearner,setSelectedLearner]=useState('');
+  const [allLearners,setAllLearners]=useState([]);
+  const [learners,setLearners]=useState([]);
+  const [attendance,setAttendance]=useState([]);
+  const [attendanceCache,setAttendanceCache]=useState({});
+  const [error,setError]=useState('');
+  const [loadingLearners,setLoadingLearners]=useState(true);
+  const [loadingAttendance,setLoadingAttendance]=useState(false);
 
- // Dashboard deliberately loads learners grade-by-grade. This avoids the
- // Supabase REST 1,000-row response limit and avoids large range requests.
- async function getLearnersByGrades(grades, streamFilter='', idFilter=''){
-   const result=[];
-   for(const grade of grades){
-     let q=supabase.from('learners')
-       .select('id,full_name,grade,stream,section,gender,residence,admission_no,kemis_no')
-       .eq('active',true)
-       .eq('grade',grade);
-     if(streamFilter) q=q.eq('stream',streamFilter);
-     if(idFilter) q=q.eq('id',idFilter);
-     if(teacher){
-       q=q.eq('grade',profile.grade||'');
-       if(profile.stream) q=q.eq('stream',profile.stream);
-       else q=q.is('stream',null);
-     }
-     const {data,error}=await q.order('full_name').limit(1000);
-     if(error) return {data:null,error:new Error(`Learners (${grade}): ${error.message}`)};
-     result.push(...(data||[]));
-   }
-   return {data:result,error:null};
- }
+  // Load each grade in parallel. This keeps the all-learner fix while avoiding
+  // the long one-grade-at-a-time wait used previously.
+  async function getLearnersByGrades(grades){
+    const queries=grades.map(async grade=>{
+      let q=supabase.from('learners')
+        .select('id,full_name,grade,stream,section,gender,residence,admission_no,kemis_no')
+        .eq('active',true)
+        .eq('grade',grade);
+      if(teacher){
+        q=q.eq('grade',profile.grade||'');
+        if(profile.stream) q=q.eq('stream',profile.stream);
+        else q=q.is('stream',null);
+      }
+      const {data,error}=await q.order('full_name').limit(1000);
+      if(error) throw new Error(`Learners (${grade}): ${error.message}`);
+      return data||[];
+    });
+    try{
+      const groups=await Promise.all(queries);
+      return {data:groups.flat(),error:null};
+    }catch(err){
+      return {data:null,error:err instanceof Error?err:new Error(String(err))};
+    }
+  }
 
- async function getAttendance(ids){
-   const rows=[];
-   for(let i=0;i<ids.length;i+=100){
-     const batch=ids.slice(i,i+100);
-     const {data,error}=await supabase.from('attendance')
-       .select('learner_id,status')
-       .eq('attendance_date',date)
-       .in('learner_id',batch);
-     if(error) return {data:null,error:new Error(`Attendance: ${error.message}`)};
-     rows.push(...(data||[]));
-   }
-   return {data:rows,error:null};
- }
+  // Attendance is requested in small batches and cached by date + learner set.
+  // This makes changing Dashboard filters much faster and avoids large .in() calls.
+  async function getAttendance(ids,targetDate=date){
+    if(!ids.length)return {data:[] ,error:null};
+    const uniqueIds=[...new Set(ids.filter(Boolean))];
+    const key=`${targetDate}|${uniqueIds.join(',')}`;
+    if(attendanceCache[key])return {data:attendanceCache[key],error:null};
 
- useEffect(()=>{
-   let cancelled=false;
-   (async()=>{
-     setBusy(true); setError('');
-     const grades=teacher?[profile.grade||'']:ALL_GRADES;
-     const {data,error}=await getLearnersByGrades(grades);
-     if(cancelled)return;
-     if(error){setBusy(false);setError(error.message);return;}
-     setAllLearners(data||[]);
-     setBusy(false);
-   })();
-   return()=>{cancelled=true};
- },[profile.id,profile.role,profile.grade,profile.stream]);
+    const batches=[];
+    for(let i=0;i<uniqueIds.length;i+=100)batches.push(uniqueIds.slice(i,i+100));
+    const results=await Promise.all(batches.map(batch=>supabase.from('attendance')
+      .select('learner_id,status')
+      .eq('attendance_date',targetDate)
+      .in('learner_id',batch)));
+    const failed=results.find(r=>r.error);
+    if(failed?.error)return {data:null,error:new Error(`Attendance: ${failed.error.message}`)};
+    const rows=results.flatMap(r=>r.data||[]);
+    setAttendanceCache(prev=>({...prev,[key]:rows}));
+    return {data:rows,error:null};
+  }
 
- const selectedSection=useMemo(()=>{
-   for(const [section,grades] of Object.entries(LEVELS)) if(grades.includes(selectedGrade)) return section;
-   return '';
- },[selectedGrade]);
+  useEffect(()=>{
+    let cancelled=false;
+    (async()=>{
+      setLoadingLearners(true);
+      setError('');
+      const grades=teacher?[profile.grade||'']:ALL_GRADES;
+      const {data,error}=await getLearnersByGrades(grades);
+      if(cancelled)return;
+      if(error){setLoadingLearners(false);setError(error.message);return;}
+      const sorted=[...(data||[])].sort((a,b)=>String(a.full_name||'').localeCompare(String(b.full_name||'')));
+      setAllLearners(sorted);
+      setLoadingLearners(false);
+    })();
+    return()=>{cancelled=true};
+  },[profile.id,profile.role,profile.grade,profile.stream]);
 
- const availableStreams=useMemo(()=>selectedSection?(STREAMS[selectedSection]||[]):[...new Set([...STREAMS.Primary,...STREAMS.JSS])],[selectedSection]);
+  const selectedSection=useMemo(()=>{
+    for(const [section,grades] of Object.entries(LEVELS)) if(grades.includes(selectedGrade)) return section;
+    return '';
+  },[selectedGrade]);
 
- const availableLearners=useMemo(()=>{
-   let rows=[...allLearners];
-   if(selectedGrade) rows=rows.filter(x=>x.grade===selectedGrade);
-   if(selectedStream) rows=rows.filter(x=>x.stream===selectedStream);
-   return rows.sort((a,b)=>String(a.full_name||'').localeCompare(String(b.full_name||'')));
- },[allLearners,selectedGrade,selectedStream]);
+  const availableStreams=useMemo(()=>selectedSection?(STREAMS[selectedSection]||[]):[...new Set([...STREAMS.Primary,...STREAMS.JSS])],[selectedSection]);
 
- useEffect(()=>{if(selectedStream&&!availableStreams.includes(selectedStream))setSelectedStream('')},[availableStreams,selectedStream]);
- useEffect(()=>{if(view==='grade'&&!selectedGrade&&!teacher)setSelectedGrade(ALL_GRADES[0])},[view,selectedGrade,teacher]);
- useEffect(()=>{if(view!=='individual')setSelectedLearner('')},[view]);
+  const availableLearners=useMemo(()=>{
+    let rows=[...allLearners];
+    if(selectedGrade)rows=rows.filter(x=>x.grade===selectedGrade);
+    if(selectedStream)rows=rows.filter(x=>x.stream===selectedStream);
+    return rows;
+  },[allLearners,selectedGrade,selectedStream]);
 
- async function load(){
-   setBusy(true);setError('');
-   let data=[];
-   if(view==='whole'){
-     data=allLearners;
-   }else if(view==='individual'&&selectedLearner){
-     data=allLearners.filter(x=>String(x.id)===String(selectedLearner));
-   }else{
-     data=allLearners.filter(x=>!selectedGrade||x.grade===selectedGrade);
-     if(view==='stream'&&selectedStream)data=data.filter(x=>x.stream===selectedStream);
-     if(teacher)data=data.filter(x=>x.grade===profile.grade&&(profile.stream?x.stream===profile.stream:x.stream==null));
-   }
-   data=[...data].sort((a,b)=>String(a.full_name||'').localeCompare(String(b.full_name||'')));
-   setLearners(data);
-   if(!data.length){setAttendance([]);setBusy(false);return;}
-   const ids=data.map(x=>x.id).filter(Boolean);
-   const {data:a,error:ae}=await getAttendance(ids);
-   if(ae){setBusy(false);setError(ae.message);return;}
-   setAttendance(a||[]);
-   setBusy(false);
- }
- useEffect(()=>{
-   if(allLearners.length||teacher) load();
- },[allLearners,date,view,selectedGrade,selectedStream,selectedLearner,profile.id,profile.role,profile.grade,profile.stream]);
+  useEffect(()=>{if(selectedStream&&!availableStreams.includes(selectedStream))setSelectedStream('')},[availableStreams,selectedStream]);
+  useEffect(()=>{if(view==='grade'&&!selectedGrade&&!teacher)setSelectedGrade(ALL_GRADES[0])},[view,selectedGrade,teacher]);
+  useEffect(()=>{if(view!=='individual')setSelectedLearner('')},[view]);
 
- const amap=useMemo(()=>Object.fromEntries(attendance.map(a=>[a.learner_id,a.status])),[attendance]);
- const stats=useMemo(()=>{
-   const count=list=>({present:list.filter(x=>amap[x.id]==='Present').length,absent:list.filter(x=>amap[x.id]==='Absent').length,total:list.length});
-   const boys=learners.filter(x=>genderIs(x.gender,'boys')), girls=learners.filter(x=>genderIs(x.gender,'girls'));
-   const board=learners.filter(x=>residenceLabel(x.residence)==='Boarder'), day=learners.filter(x=>residenceLabel(x.residence)==='Day Scholar');
-   return {boys:count(boys),girls:count(girls),grand:count(learners),boarders:count(board),day:count(day),boarderBoys:count(board.filter(x=>genderIs(x.gender,'boys'))),boarderGirls:count(board.filter(x=>genderIs(x.gender,'girls'))),dayBoys:count(day.filter(x=>genderIs(x.gender,'boys'))),dayGirls:count(day.filter(x=>genderIs(x.gender,'girls')))};
- },[learners,amap]);
- const pct=stats.grand.total?Math.round(stats.grand.present/stats.grand.total*100):0;
- const selectedLabel=teacher?`${profile.grade||''} • ${profile.stream||''}`:view==='whole'?'Whole School':view==='grade'?`${selectedGrade||'Select Grade'} • All Streams`:view==='stream'?`${selectedGrade||'All Grades'} • ${selectedStream||'Select Stream'}`:availableLearners.find(l=>String(l.id)===String(selectedLearner))?.full_name||'Select Learner';
- const heading=teacher?`My Stream — ${profile.grade||''} ${profile.stream||''}`:view==='whole'?'Whole School Attendance':view==='grade'?`${selectedGrade||'Grade'} Attendance`:view==='stream'?`${selectedGrade||'All Grades'} • ${selectedStream||'Stream'} Attendance`:selectedLearner?'Individual Learner Attendance':'Individual Attendance';
- const Summary=({title,icon,tone,boys,girls,total})=><div className={`summaryPanel ${tone}`}><div className="summaryTitle"><span>{icon}</span><b>{title}</b></div><div className="summaryTable"><div className="summaryHead"><span>Gender</span><span>Present</span><span>Absent</span><span>Total</span></div><div className="summaryRow"><span>👦 Boys</span><span>{boys.present}</span><span>{boys.absent}</span><span>{boys.total}</span></div><div className="summaryRow"><span>👧 Girls</span><span>{girls.present}</span><span>{girls.absent}</span><span>{girls.total}</span></div><div className="summaryRow totalRow"><span>{title} Total</span><span>{total.present}</span><span>{total.absent}</span><span>{total.total}</span></div></div></div>;
- return <>
-   <div className="heroBar"><div><div className="eyebrow">ATTENDANCE DASHBOARD</div><h3>{heading}</h3><p>{settings.schoolName} • {date}</p>{!teacher&&<div className="selectedContext"><b>Selected:</b> {selectedLabel}</div>}</div><div className="heroRate"><strong>{pct}%</strong><span>Attendance Rate</span></div></div>
-   <div className="card dashboardFilter"><div className="filterTitle"><div><h3>Find Attendance</h3><p className="muted">Search the whole school, grade, stream or individual learner.</p></div>{admin&&<button type="button" className={view==='whole'?'wholeSchoolBtn active':'wholeSchoolBtn'} onClick={()=>{setView('whole');setSelectedGrade('');setSelectedStream('');setSelectedLearner('')}}>🏫 Whole School Attendance</button>}</div>
-   <div className="filterGrid dashboardControls"><label>Date<input type="date" value={date} onChange={e=>setDate(e.target.value)}/></label>
-   {admin?<label>Search By<select value={view} onChange={e=>{const v=e.target.value;setView(v);setSelectedLearner('');if(v==='whole'){setSelectedGrade('');setSelectedStream('')}else if(v==='grade'){setSelectedStream('')}}}><option value="whole">Whole School</option><option value="grade">Grade / Class</option><option value="stream">Stream</option><option value="individual">Individual Learner</option></select></label>:<label>Assigned Class & Stream<input value={`${profile.grade||''} • ${profile.stream||''}`} readOnly/></label>}
-   {admin&&view!=='whole'&&<label>Grade / Class<select value={selectedGrade} onChange={e=>{setSelectedGrade(e.target.value);setSelectedStream('');setSelectedLearner('');if(e.target.value)setView('grade')}}><option value="">All Grades / Select Grade</option><optgroup label="ECDE">{LEVELS.ECDE.map(g=><option key={g} value={g}>{g}</option>)}</optgroup><optgroup label="Primary">{LEVELS.Primary.map(g=><option key={g} value={g}>{g}</option>)}</optgroup><optgroup label="JSS">{LEVELS.JSS.map(g=><option key={g} value={g}>{g}</option>)}</optgroup></select></label>}
-   {admin&&view!=='whole'&&selectedGrade&&selectedSection!=='ECDE'&&<label>Stream<select value={selectedStream} onChange={e=>{const v=e.target.value;setSelectedStream(v);setSelectedLearner('');setView(v?'stream':'grade')}}><option value="">All Streams — Entire {selectedGrade}</option>{availableStreams.map(s=><option key={s} value={s}>{selectedGrade} {s}</option>)}</select></label>}
-   {admin&&view==='stream'&&!selectedGrade&&<label>Stream<select value={selectedStream} onChange={e=>{setSelectedStream(e.target.value);setSelectedLearner('')}}><option value="">Select Stream</option>{availableStreams.map(s=><option key={s} value={s}>{s}</option>)}</select></label>}
-   {admin&&view==='individual'&&<label>Individual Learner<select value={selectedLearner} onChange={e=>setSelectedLearner(e.target.value)}><option value="">Select Learner</option>{availableLearners.map(l=><option key={l.id} value={l.id}>{l.full_name} — {l.grade||''} • {l.stream||''}</option>)}</select></label>}
-   </div></div>
-   {busy&&<div className="card muted">Loading complete learner list…</div>}
-   {error&&<div className="card error autoDismiss" role="alert">Dashboard could not read data: {error}</div>}
-   <div className="topStats"><Stat tone="boys" icon="👦" title="Total Boys" data={stats.boys}/><Stat tone="girls" icon="👧" title="Total Girls" data={stats.girls}/><Stat tone="grand" icon="👥" title="Grand Total" data={stats.grand}/></div>
-   <div className="summaryGrid"><Summary title="BOARDERS" icon="🛏️" tone="blue" boys={stats.boarderBoys} girls={stats.boarderGirls} total={stats.boarders}/><Summary title="DAY SCHOLARS" icon="🏫" tone="green" boys={stats.dayBoys} girls={stats.dayGirls} total={stats.day}/></div>
-   <div className="summaryPanel purple schoolTotal"><div className="summaryTitle"><span>🏫</span><b>SCHOOL TOTAL</b></div><div className="summaryTable"><div className="summaryHead"><span>Gender</span><span>Present</span><span>Absent</span><span>Total</span></div><div className="summaryRow"><span>👦 Total Boys</span><span>{stats.boys.present}</span><span>{stats.boys.absent}</span><span>{stats.boys.total}</span></div><div className="summaryRow"><span>👧 Total Girls</span><span>{stats.girls.present}</span><span>{stats.girls.absent}</span><span>{stats.girls.total}</span></div><div className="summaryRow grandRow"><span>GRAND TOTAL</span><span>{stats.grand.present}</span><span>{stats.grand.absent}</span><span>{stats.grand.total}</span></div></div></div>
- </>;
+  // Filter locally first, display the learner list immediately, then load attendance.
+  useEffect(()=>{
+    let cancelled=false;
+    if(loadingLearners)return;
+    const load=async()=>{
+      setError('');
+      let data=[];
+      if(view==='whole'){
+        data=allLearners;
+      }else if(view==='individual'&&selectedLearner){
+        data=allLearners.filter(x=>String(x.id)===String(selectedLearner));
+      }else{
+        data=allLearners.filter(x=>!selectedGrade||x.grade===selectedGrade);
+        if(view==='stream'&&selectedStream)data=data.filter(x=>x.stream===selectedStream);
+        if(teacher)data=data.filter(x=>x.grade===profile.grade&&(profile.stream?x.stream===profile.stream:x.stream==null));
+      }
+      data=[...data].sort((a,b)=>String(a.full_name||'').localeCompare(String(b.full_name||'')));
+      setLearners(data);
+      setLoadingAttendance(false);
+      setAttendance([]);
+      if(!data.length)return;
+
+      setLoadingAttendance(true);
+      const ids=data.map(x=>x.id).filter(Boolean);
+      const {data:a,error:ae}=await getAttendance(ids,date);
+      if(cancelled)return;
+      if(ae){setLoadingAttendance(false);setError(ae.message);return;}
+      setAttendance(a||[]);
+      setLoadingAttendance(false);
+    };
+    load();
+    return()=>{cancelled=true};
+  },[allLearners,loadingLearners,date,view,selectedGrade,selectedStream,selectedLearner,profile.id,profile.role,profile.grade,profile.stream]);
+
+  const amap=useMemo(()=>Object.fromEntries(attendance.map(a=>[a.learner_id,a.status])),[attendance]);
+  const stats=useMemo(()=>{
+    const count=list=>({present:list.filter(x=>amap[x.id]==='Present').length,absent:list.filter(x=>amap[x.id]==='Absent').length,total:list.length});
+    const boys=learners.filter(x=>genderIs(x.gender,'boys')), girls=learners.filter(x=>genderIs(x.gender,'girls'));
+    const board=learners.filter(x=>residenceLabel(x.residence)==='Boarder'), day=learners.filter(x=>residenceLabel(x.residence)==='Day Scholar');
+    return {boys:count(boys),girls:count(girls),grand:count(learners),boarders:count(board),day:count(day),boarderBoys:count(board.filter(x=>genderIs(x.gender,'boys'))),boarderGirls:count(board.filter(x=>genderIs(x.gender,'girls'))),dayBoys:count(day.filter(x=>genderIs(x.gender,'boys'))),dayGirls:count(day.filter(x=>genderIs(x.gender,'girls')))};
+  },[learners,amap]);
+  const pct=stats.grand.total?Math.round(stats.grand.present/stats.grand.total*100):0;
+  const selectedLabel=teacher?`${profile.grade||''} • ${profile.stream||''}`:view==='whole'?'Whole School':view==='grade'?`${selectedGrade||'Select Grade'} • All Streams`:view==='stream'?`${selectedGrade||'All Grades'} • ${selectedStream||'Select Stream'}`:availableLearners.find(l=>String(l.id)===String(selectedLearner))?.full_name||'Select Learner';
+  const heading=teacher?`My Stream — ${profile.grade||''} ${profile.stream||''}`:view==='whole'?'Whole School Attendance':view==='grade'?`${selectedGrade||'Grade'} Attendance`:view==='stream'?`${selectedGrade||'All Grades'} • ${selectedStream||'Stream'} Attendance`:selectedLearner?'Individual Learner Attendance':'Individual Attendance';
+  const Summary=({title,icon,tone,boys,girls,total})=><div className={`summaryPanel ${tone}`}><div className="summaryTitle"><span>{icon}</span><b>{title}</b></div><div className="summaryTable"><div className="summaryHead"><span>Gender</span><span>Present</span><span>Absent</span><span>Total</span></div><div className="summaryRow"><span>👦 Boys</span><span>{boys.present}</span><span>{boys.absent}</span><span>{boys.total}</span></div><div className="summaryRow"><span>👧 Girls</span><span>{girls.present}</span><span>{girls.absent}</span><span>{girls.total}</span></div><div className="summaryRow totalRow"><span>{title} Total</span><span>{total.present}</span><span>{total.absent}</span><span>{total.total}</span></div></div></div>;
+  return <>
+    <div className="heroBar"><div><div className="eyebrow">ATTENDANCE DASHBOARD</div><h3>{heading}</h3><p>{settings.schoolName} • {date}</p>{!teacher&&<div className="selectedContext"><b>Selected:</b> {selectedLabel}</div>}</div><div className="heroRate"><strong>{pct}%</strong><span>Attendance Rate</span></div></div>
+    <div className="card dashboardFilter"><div className="filterTitle"><div><h3>Find Attendance</h3><p className="muted">Search the whole school, grade, stream or individual learner.</p></div>{admin&&<button type="button" className={view==='whole'?'wholeSchoolBtn active':'wholeSchoolBtn'} onClick={()=>{setView('whole');setSelectedGrade('');setSelectedStream('');setSelectedLearner('')}}>🏫 Whole School Attendance</button>}</div>
+    <div className="filterGrid dashboardControls"><label>Date<input type="date" value={date} onChange={e=>setDate(e.target.value)}/></label>
+    {admin?<label>Search By<select value={view} onChange={e=>{const v=e.target.value;setView(v);setSelectedLearner('');if(v==='whole'){setSelectedGrade('');setSelectedStream('')}else if(v==='grade'){setSelectedStream('')}}}><option value="whole">Whole School</option><option value="grade">Grade / Class</option><option value="stream">Stream</option><option value="individual">Individual Learner</option></select></label>:<label>Assigned Class & Stream<input value={`${profile.grade||''} • ${profile.stream||''}`} readOnly/></label>}
+    {admin&&view!=='whole'&&<label>Grade / Class<select value={selectedGrade} onChange={e=>{setSelectedGrade(e.target.value);setSelectedStream('');setSelectedLearner('');if(e.target.value)setView('grade')}}><option value="">All Grades / Select Grade</option><optgroup label="ECDE">{LEVELS.ECDE.map(g=><option key={g} value={g}>{g}</option>)}</optgroup><optgroup label="Primary">{LEVELS.Primary.map(g=><option key={g} value={g}>{g}</option>)}</optgroup><optgroup label="JSS">{LEVELS.JSS.map(g=><option key={g} value={g}>{g}</option>)}</optgroup></select></label>}
+    {admin&&view!=='whole'&&selectedGrade&&selectedSection!=='ECDE'&&<label>Stream<select value={selectedStream} onChange={e=>{const v=e.target.value;setSelectedStream(v);setSelectedLearner('');setView(v?'stream':'grade')}}><option value="">All Streams — Entire {selectedGrade}</option>{availableStreams.map(s=><option key={s} value={s}>{selectedGrade} {s}</option>)}</select></label>}
+    {admin&&view==='stream'&&!selectedGrade&&<label>Stream<select value={selectedStream} onChange={e=>{setSelectedStream(e.target.value);setSelectedLearner('')}}><option value="">Select Stream</option>{availableStreams.map(s=><option key={s} value={s}>{s}</option>)}</select></label>}
+    {admin&&view==='individual'&&<label>Individual Learner<select value={selectedLearner} onChange={e=>setSelectedLearner(e.target.value)}><option value="">Select Learner</option>{availableLearners.map(l=><option key={l.id} value={l.id}>{l.full_name} — {l.grade||''} • {l.stream||''}</option>)}</select></label>}
+    </div></div>
+    {loadingLearners&&<div className="card muted">Loading learners…</div>}
+    {!loadingLearners&&!loadingAttendance&&<div className="card muted">Learners loaded. Attendance is up to date.</div>}
+    {loadingAttendance&&<div className="card muted">Loading attendance for {learners.length} learners…</div>}
+    {error&&<div className="card error autoDismiss" role="alert">Dashboard could not read data: {error}</div>}
+    <div className="topStats"><Stat tone="boys" icon="👦" title="Total Boys" data={stats.boys}/><Stat tone="girls" icon="👧" title="Total Girls" data={stats.girls}/><Stat tone="grand" icon="👥" title="Grand Total" data={stats.grand}/></div>
+    <div className="summaryGrid"><Summary title="BOARDERS" icon="🛏️" tone="blue" boys={stats.boarderBoys} girls={stats.boarderGirls} total={stats.boarders}/><Summary title="DAY SCHOLARS" icon="🏫" tone="green" boys={stats.dayBoys} girls={stats.dayGirls} total={stats.day}/></div>
+    <div className="summaryPanel purple schoolTotal"><div className="summaryTitle"><span>🏫</span><b>SCHOOL TOTAL</b></div><div className="summaryTable"><div className="summaryHead"><span>Gender</span><span>Present</span><span>Absent</span><span>Total</span></div><div className="summaryRow"><span>👦 Total Boys</span><span>{stats.boys.present}</span><span>{stats.boys.absent}</span><span>{stats.boys.total}</span></div><div className="summaryRow"><span>👧 Total Girls</span><span>{stats.girls.present}</span><span>{stats.girls.absent}</span><span>{stats.girls.total}</span></div><div className="summaryRow grandRow"><span>GRAND TOTAL</span><span>{stats.grand.present}</span><span>{stats.grand.absent}</span><span>{stats.grand.total}</span></div></div></div>
+  </>;
 }
+
 function Stat({tone,icon,title,data}){return <div className={`bigStat ${tone}`}><span>{icon}</span><div><small>{title}</small><strong>{data.total}</strong><p>Present {data.present} · Absent {data.absent}</p></div></div>}
 
 function Learners({profile,admin,show}){
